@@ -1,4 +1,4 @@
-﻿namespace PasswordFinder
+﻿﻿namespace PasswordFinder
 {
     partial class Form1
     {
@@ -52,6 +52,7 @@
             this.langToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.engToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.rusToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
+            this.exportToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.label3 = new System.Windows.Forms.Label();
             this.statusStrip1.SuspendLayout();
             this.menuStrip1.SuspendLayout();
@@ -184,7 +185,8 @@
             // preferencesToolStripMenuItem
             // 
             this.preferencesToolStripMenuItem.DropDownItems.AddRange(new System.Windows.Forms.ToolStripItem[] {
-            this.langToolStripMenuItem});
+            this.langToolStripMenuItem,
+            this.exportToolStripMenuItem});
             this.preferencesToolStripMenuItem.Name = "preferencesToolStripMenuItem";
             resources.ApplyResources(this.preferencesToolStripMenuItem, "preferencesToolStripMenuItem");
             // 
@@ -207,6 +209,12 @@
             this.rusToolStripMenuItem.Name = "rusToolStripMenuItem";
             resources.ApplyResources(this.rusToolStripMenuItem, "rusToolStripMenuItem");
             this.rusToolStripMenuItem.Click += new System.EventHandler(this.RusToolStripMenuItem_Click);
+            // 
+            // exportToolStripMenuItem
+            // 
+            this.exportToolStripMenuItem.Name = "exportToolStripMenuItem";
+            resources.ApplyResources(this.exportToolStripMenuItem, "exportToolStripMenuItem");
+            this.exportToolStripMenuItem.Click += new System.EventHandler(this.ExportToolStripMenuItem_Click);
             // 
             // label3
             // 
@@ -271,7 +279,7 @@
         private System.Windows.Forms.ToolStripMenuItem langToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem engToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem rusToolStripMenuItem;
+        private System.Windows.Forms.ToolStripMenuItem exportToolStripMenuItem;
         private System.Windows.Forms.Label label3;
     }
 }
-

@@ -4,41 +4,41 @@ using System.IO;
 using System.Data;
 using System.Text;
 using System.Windows.Forms;
+using System.Linq;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
-using Word = Microsoft.Office.Interop.Word;
 using System.Xml;
 using PasswordFinder.Properties;
+using System.Threading.Tasks;
+using System.Threading;
+using System.Collections.Concurrent;
+using DocumentFormat.OpenXml.Packaging;
+using DocumentFormat.OpenXml.Wordprocessing;
+using NPOI.POIFS.FileSystem;
+using NPOI.POIFS.Crypt;
+using NPOI.HWPF.Extractor;
+using NPOI.XWPF.UserModel;
 
 
 namespace PasswordFinder
 {
     public partial class Form1 : Form
     {
+        private CancellationTokenSource _cts;
+
         public Form1()
         {
             InitializeComponent();
         }
         private List<string> RemoveDuplicate(List<string> sourceList)
         {
-            sourceList.Sort();
-            for (int i = sourceList.Count - 1; i >= 0; i--)
-                for (int j = sourceList.Count - 1; j >= 0; j--)
-                    if (i != j)
-                        if (sourceList[i].Equals(sourceList[j]))
-                        {
-                            sourceList.RemoveAt(i);
-                            break;
-                        }
-                        else
-                        {
-                            if (sourceList[i].Contains("~$"))
-                            {
-                                sourceList.RemoveAt(i);
-                                break;
-                            }
-                        }
-            return sourceList;
+            if (sourceList == null) return new List<string>();
+
+            return sourceList
+                .Where(f => !f.Contains("~$"))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(f => f)
+                .ToList();
         }
 
         /// <summary>
@@ -61,192 +61,331 @@ namespace PasswordFinder
                 pat += ",*.xml";
             return pat;
         }
-        private void Button1_Click(object sender, EventArgs e)
+
+        private IEnumerable<string> GetFilesSafe(string root, System.Text.RegularExpressions.Regex patternRegex, CancellationToken ct)
         {
+            var pending = new Stack<string>();
+            pending.Push(root);
+            while (pending.Count > 0)
+            {
+                string path = pending.Pop();
+
+                ct.ThrowIfCancellationRequested();
+
+                // Enumerate files in current directory
+                IEnumerable<string> files = null;
+                try { files = Directory.EnumerateFiles(path, "*", SearchOption.TopDirectoryOnly); }
+                catch { }
+
+                if (files != null)
+                {
+                    foreach (var file in files)
+                    {
+                        string fileName = Path.GetFileName(file);
+                        if (fileName.StartsWith("~$")) continue;
+                        if (patternRegex.IsMatch(fileName)) yield return file;
+                    }
+                }
+
+                // Enumerate subdirectories
+                IEnumerable<string> subDirs = null;
+                try { subDirs = Directory.EnumerateDirectories(path, "*", SearchOption.TopDirectoryOnly); }
+                catch { }
+
+                if (subDirs != null)
+                {
+                    foreach (var subDir in subDirs) { pending.Push(subDir); }
+                }
+            }
+        }
+
+        private async void Button1_Click(object sender, EventArgs e)
+        {
+            if (_cts != null)
+            {
+                _cts.Cancel();
+                return;
+            }
+
             string[] Directories = richTextBox1.Lines;
-            List<string> Files = new List<string>();
-            List<string> Files_with_password = new List<string>();
-            
             string[] File_patterns = Prepare_File_patterns(richTextBox2.Text).Split(',');
             string[] PWD_patterns = richTextBox3.Text.Split(',');
-            for (int i = 0; i < Directories.Length; i++)
-                for (int j = 0; j < File_patterns.Length; j++)
-                    Files.AddRange(Directory.GetFiles(Directories[i], File_patterns[j], SearchOption.AllDirectories));
 
-            RemoveDuplicate(Files);//удалить дубликаты найденные по разным правилам
-            for (int f = 0; f < Files.Count; f++)
+            _cts = new CancellationTokenSource();
+            var token = _cts.Token;
+
+            string originalButtonText = button1.Text;
+            button1.Text = (rusToolStripMenuItem.Checked || label3.Text.Contains("Папки")) ? "Остановить" : "Stop";
+            
+            listView1.Items.Clear();
+            toolStripStatusLabel1.Text = "Инициализация поиска...";
+            try
             {
-                string ext = Path.GetExtension(Files[f]).ToLower();
-                toolStripStatusLabel1.Text = f + 1 + " / " + Files.Count;
-                bool isexit = false;
-                if (Files[f].Contains(".xls", StringComparison.OrdinalIgnoreCase))
+            await Task.Run(() =>
+            {
+                List<string> Files = new List<string>();
+                ConcurrentBag<string> Files_with_password = new ConcurrentBag<string>();
+
+                var patterns = File_patterns
+                    .Where(p => !string.IsNullOrWhiteSpace(p))
+                    .Select(p => p.Trim())
+                    .ToList();
+
+                if (patterns.Count == 0) return;
+
+                // Create a Regex for efficient single-pass matching of all patterns
+                string regexString = "^(" + string.Join("|", patterns.Select(p =>
+                    System.Text.RegularExpressions.Regex.Escape(p)
+                        .Replace(@"\*", ".*")
+                        .Replace(@"\?", ".")
+                )) + ")$";
+
+                var patternRegex = new System.Text.RegularExpressions.Regex(regexString,
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+                // Поиск файлов во всех указанных директориях
+                for (int i = 0; i < Directories.Length; i++)
                 {
-                    //--------------------------------------------Sergiomarotco Slow way
-                    /*Excel.Worksheet Sheet = new Excel.Worksheet(); //какой-то рабочий лист Excel
-                    Excel.Application Excel_App = new Excel.Application(); //создаём приложение Excel
-                    Excel.Workbook Book = Excel_App.Workbooks.Open(Files[f]); //открываем наш файл (Рабочую книгу Excel) //xlApp.Visible = true; //сделать Excel видимым, но это не обязательно
-                    foreach (Excel.Worksheet worksheet in Book.Worksheets)
+                    if (string.IsNullOrWhiteSpace(Directories[i]) || !Directory.Exists(Directories[i])) continue;
+                    Files.AddRange(GetFilesSafe(Directories[i], patternRegex, token));
+                }
+
+                Files = RemoveDuplicate(Files);//удалить дубликаты найденные по разным правилам
+
+                int processedCount = 0;
+                Parallel.ForEach(Files, new ParallelOptions 
+                { 
+                    CancellationToken = token,
+                    MaxDegreeOfParallelism = Environment.ProcessorCount 
+                }, currentFile =>
+                {
+                    token.ThrowIfCancellationRequested();
+
+                    string ext = Path.GetExtension(currentFile).ToLower();
+                    int currentProgress = Interlocked.Increment(ref processedCount);
+                    this.Invoke((MethodInvoker)delegate { toolStripStatusLabel1.Text = string.Format("{0} / {1}", currentProgress, Files.Count); });
+
+                    // Generate a list of potential passwords to try (null/empty + known search patterns)
+                    var passwordsToTry = new List<string> { null };
+                    passwordsToTry.AddRange(PWD_patterns.Where(p => !string.IsNullOrWhiteSpace(p)).Select(p => p.Trim()));
+                    var uniquePasswords = passwordsToTry.Distinct().ToList();
+
+                    bool isexit = false;
+                    if (currentFile.Contains(".xls", StringComparison.OrdinalIgnoreCase))
                     {
-                        Sheet = Book.Worksheets[worksheet.Name]; //присваиваем переменной iSht Лист1 или так xlSht = xlWB.ActiveSheet //активный лист
-                        for (int p = 0; p < PWD_patterns.Length; p++)
+                        try
                         {
-                            Excel.Range range = Sheet.get_Range("A1", "J100").Find(PWD_patterns[p]);
-                            if (range != null)
+                            using (FileStream stream = File.Open(currentFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                             {
-                                string findedpwd = string.Empty;
-                                try
+                                foreach (var pass in uniquePasswords)
                                 {
-                                    if ((range.Column - 2) >= 0)
-                                        findedpwd += Sheet.get_Range(GetLetterByNum(range.Column - 2) + range.Row.ToString()).Text + " ";
-                                }
-                                catch (Exception ee) { MessageBox.Show(ee.ToString()); }
-                                try
-                                {
-                                    if ((range.Column - 1) >= 0)
-                                        findedpwd += Sheet.get_Range(GetLetterByNum(range.Column - 1) + range.Row.ToString()).Text + " ";
-                                }
-                                catch (Exception ee) { MessageBox.Show(ee.ToString()); }
-                                try
-                                {
-                                    if ((range.Column) >= 0)
-                                        findedpwd += Sheet.get_Range(GetLetterByNum(range.Column) + range.Row.ToString()).Text + " ";
-                                }
-                                catch (Exception ee) { MessageBox.Show(ee.ToString()); }
-                                findedpwd += Sheet.get_Range(GetLetterByNum(range.Column + 1) + range.Row.ToString()).Text + " ";
-                                findedpwd += Sheet.get_Range(GetLetterByNum(range.Column + 2) + range.Row.ToString()).Text + " ";
-                                listView1.Items.Add(new ListViewItem(new string[] { Files[f], findedpwd.TrimEnd(' ').TrimStart(' '), ext }));
-                            }
-                        }
-                    }
-                    Book.Close(false); //сохраняем и закрываем файл, если false - то закрыть и не сохранить изменения
-                    Excel_App.Quit();
-                    */
-                    try
-                    {
-                        //--------------------------------------------https://github.com/ExcelDataReader Faster way
-                        using (FileStream stream = File.Open(Files[f], FileMode.Open, FileAccess.Read))
-                        {
-                            // Auto-detect format, supports:
-                            //  - Binary Excel files (2.0-2003 format; *.xls)
-                            //  - OpenXml Excel files (2007 format; *.xlsx)
-                            using (IExcelDataReader reader = ExcelReaderFactory.CreateReader(stream))
-                            {
-                                do
-                                {
-                                    while (reader.Read())
+                                    try
                                     {
-                                        // reader.GetDouble(0);
-                                    }
-                                } while (reader.NextResult());
-                                DataSet result = reader.AsDataSet();// The result of each spreadsheet is in result.Tables
-                                for (int t = 0; t < result.Tables.Count; t++)
-                                {
-                                    for (int p = 0; p < PWD_patterns.Length; p++)
-                                    {
-                                        int columns_c = result.Tables[t].Columns.Count;
-                                        //if (columns_c > 3) columns_c = 3;
-                                        for (int c = 0; c < columns_c; c++)
+                                        stream.Position = 0;
+                                        using (IExcelDataReader reader = ExcelReaderFactory.CreateReader(stream, new ExcelReaderConfiguration { Password = pass }))
                                         {
-                                            DataRow[] range = result.Tables[t].Select(result.Tables[t].Columns[c].ColumnName + " like '%" + PWD_patterns[p] + "%'");
-                                            if (range != null)
+                                            DataSet result = reader.AsDataSet();
+                                            for (int t = 0; t < result.Tables.Count; t++)
                                             {
-                                                if (range.Length != 0)
+                                                for (int p = 0; p < PWD_patterns.Length; p++)
                                                 {
-                                                    for (int j = 0; j < range.Length; j++)
+                                                    int columns_c = result.Tables[t].Columns.Count;
+                                                    for (int c = 0; c < columns_c; c++)
                                                     {
-                                                        listView1.Items.Add(new ListViewItem(new string[] { Files[f], String.Join(" ", range[j].ItemArray), ext }));
+                                                        DataRow[] range = result.Tables[t].Select(result.Tables[t].Columns[c].ColumnName + " like '%" + PWD_patterns[p] + "%'");
+                                                        if (range != null && range.Length != 0)
+                                                        {
+                                                            for (int j = 0; j < range.Length; j++)
+                                                            {
+                                                                string lineData = String.Join(" ", range[j].ItemArray);
+                                                                this.Invoke((MethodInvoker)delegate
+                                                                {
+                                                                    listView1.Items.Add(new ListViewItem(new string[] { currentFile, lineData, ext }));
+                                                                });
+                                                            }
+                                                        }
                                                     }
                                                 }
+                                            }
+                                        }
+                                        break; // If we reached here, the password was correct (or not needed)
+                                    }
+                                    catch (ExcelDataReader.Exceptions.HeaderException ex) when (ex.Message.Contains("password")) { continue; }
+                                    catch { break; }
+                                }
+                            }
+                        }
+                        catch { }
+                        isexit = true;
+                    }
+                    if (currentFile.Contains(".docx", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            foreach (var pass in uniquePasswords)
+                            {
+                                try
+                                {
+                                    if (pass == null) // Try normal open first
+                                    {
+                                        using (WordprocessingDocument wordDoc = WordprocessingDocument.Open(currentFile, false))
+                                        {
+                                            var body = wordDoc.MainDocumentPart?.Document?.Body;
+                                            if (body != null)
+                                            {
+                                                foreach (var p in PWD_patterns)
+                                                {
+                                                    var matches = body.Descendants<Paragraph>().Where(para => para.InnerText.Contains(p, StringComparison.OrdinalIgnoreCase));
+                                                    foreach (var match in matches)
+                                                    {
+                                                        string context = match.InnerText;
+                                                        this.Invoke((MethodInvoker)delegate { listView1.Items.Add(new ListViewItem(new string[] { currentFile, context.Trim(), ext })); });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    else // Try opening as an encrypted OOXML package using NPOI
+                                    {
+                                        using (FileStream fs = File.Open(currentFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                                        {
+                                            var nfs = new NPOI.POIFS.FileSystem.POIFSFileSystem(fs);
+                                            var info = new NPOI.POIFS.Crypt.EncryptionInfo(nfs);
+                                            var d = NPOI.POIFS.Crypt.Decryptor.GetInstance(info);
+                                            if (d.VerifyPassword(pass))
+                                            {
+                                                using (var dataStream = d.GetDataStream(nfs))
+                                                {
+                                                    var xdoc = new NPOI.XWPF.UserModel.XWPFDocument(dataStream);
+                                                    foreach (var p in PWD_patterns)
+                                                    {
+                                                        foreach (var para in xdoc.Paragraphs)
+                                                            if (para.ParagraphText.Contains(p, StringComparison.OrdinalIgnoreCase))
+                                                                this.Invoke((MethodInvoker)delegate { listView1.Items.Add(new ListViewItem(new string[] { currentFile, para.ParagraphText.Trim(), ext })); });
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                catch { continue; }
+                            }
+                        }
+                        catch { }
+                        isexit = true;
+                    }
+                    if (currentFile.EndsWith(".doc", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            using (FileStream fs = new FileStream(currentFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                            {
+                                WordExtractor extractor = new WordExtractor(fs);
+                                string[] paragraphs = extractor.ParagraphText;
+
+                                if (paragraphs != null)
+                                {
+                                    foreach (var p in PWD_patterns)
+                                    {
+                                        foreach (var paraText in paragraphs)
+                                        {
+                                            if (paraText.Contains(p, StringComparison.OrdinalIgnoreCase))
+                                            {
+                                                this.Invoke((MethodInvoker)delegate
+                                                {
+                                                    listView1.Items.Add(new ListViewItem(new string[] { currentFile, paraText.Trim(), ext }));
+                                                });
                                             }
                                         }
                                     }
                                 }
                             }
                         }
+                        catch { }
+                        isexit = true;
                     }
-                    catch { }
-                    isexit = true;
-                }
-                if (Files[f].Contains(".docx", StringComparison.OrdinalIgnoreCase))
-                {
-                    try
+                    if (currentFile.Contains(".xml", StringComparison.OrdinalIgnoreCase))
                     {
-                        Word.Application app = new Word.Application();
-                        var doc = app.Documents.Open(Files[f]);
-                        for (int p = 0; p < PWD_patterns.Length; p++)
+                        try
                         {
-                            //FindReplace(documentLocation, findText, replaceText);
-                            var range = doc.Range();
-                            //Word.Application.Selection.Find.ClearFormatting();
-                            if (range.Find.Execute(PWD_patterns[p]))
+                            XmlDocument doc = new XmlDocument();
+                            doc.Load(currentFile);
+                            for (int p = 0; p < PWD_patterns.Length; p++)
                             {
-                                Word.Range wordRange;// диапазон документа Word
-                                try
+                                XmlNodeList elemList = doc.GetElementsByTagName(PWD_patterns[p]);
+                                for (int i = 0; i < elemList.Count; i++)
                                 {
-                                    for (int i = 1; i <= doc.Sections.Count; i++)// обходим все разделы документа
+                                    string xmlString = elemList[i].OuterXml;
+                                    this.Invoke((MethodInvoker)delegate
                                     {
-                                        wordRange = doc.Sections[i].Range;// берем всю секцию диапазоном                                   
-                                        wordRange.Find.Execute(PWD_patterns[p]);// выполняем метод поискаи замены обьекта диапазона ворд
-                                    }
+                                        listView1.Items.Add(new ListViewItem(new string[] { currentFile, xmlString, ext }));
+                                    });
                                 }
-                                catch { }
-                                // завершение функции поиска и замены SearchAndReplace
                             }
                         }
-                        doc.Close();
-                        app.Quit();
-                        Marshal.ReleaseComObject(app);
+                        catch { }
+                        isexit = true;
                     }
-                    catch { }                 
-                    isexit = true;
-                }
-                if (Files[f].Contains(".xml", StringComparison.OrdinalIgnoreCase))
-                {
-                    XmlDocument doc = new XmlDocument();
-                    doc.Load(Files[f]);
+                    if (!isexit)// Поиск по текстовому содержимому
+                    {
+                        try
+                        {
+                            string[] Lines = File.ReadAllLines(currentFile, Encoding.Default);
+                            for (int l = 0; l < Lines.Length; l++)
+                            {
+                                for (int p = 0; p < PWD_patterns.Length; p++)
+                                {
+                                    if (Lines[l].Contains(PWD_patterns[p], StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        Files_with_password.Add(currentFile);
+                                        string[] Words = Lines[l].Split(' ');
+                                        for (int w = 0; w < Words.Length; w++)
+                                        {
+                                            if (Words[w].Contains(PWD_patterns[p]))
+                                            {
+                                                string findedpwd = string.Empty;
+                                                int w2 = w;
+                                                if ((w2 - 2) >= 0) findedpwd += Words[w2 - 2] + " ";
+                                                if ((w2 - 1) >= 0) findedpwd += Words[w2 - 1] + " ";
+                                                if ((w2) >= 0) findedpwd += Words[w2] + " ";
+                                                if ((w2 + 1) < Words.Length) findedpwd += Words[w2 + 1] + " ";
+                                                if ((w2 + 2) < Words.Length) findedpwd += Words[w2 + 2] + " ";
+                                                
+                                                string resultText = findedpwd.Trim();
+                                                this.Invoke((MethodInvoker)delegate
+                                                {
+                                                    listView1.Items.Add(new ListViewItem(new string[] { currentFile, resultText, ext }));
+                                                });
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                });
+            }, token);
 
-                    for (int p = 0; p < PWD_patterns.Length; p++)
-                    {//Display all the book titles.
-                        XmlNodeList elemList = doc.GetElementsByTagName(PWD_patterns[p]);
-                        for (int i = 0; i < elemList.Count; i++)
-                        {
-                            listView1.Items.Add(new ListViewItem(new string[] { Files[f], elemList[i].OuterXml, ext }));
-                        }
-                    }
-                    isexit = true;
-                }
-                if (!isexit)//если это не word и не excel то втупую поиск по файлу
-                {
-                    string findedpwd = string.Empty;
-                    string[] Lines = File.ReadAllLines(Files[f], Encoding.Default);
-                    for (int l = 0; l < Lines.Length; l++)
-                    {
-                        for (int p = 0; p < PWD_patterns.Length; p++)
-                        {
-                            if (Lines[l].Contains(PWD_patterns[p], StringComparison.OrdinalIgnoreCase))
-                            {
-                                Files_with_password.Add(Files[f]);
-                                string[] Words = Lines[l].Split(' ');
-                                for (int w = 0; w < Words.Length; w++)
-                                {
-                                    if (Words[w].Contains(PWD_patterns[p]))
-                                    {
-                                        int w2 = w;
-                                        if ((w2 - 2) >= 0) findedpwd += Words[w2 - 2] + " ";
-                                        if ((w2 - 1) >= 0) findedpwd += Words[w2 - 1] + " ";
-                                        if ((w2) >= 0) findedpwd += Words[w2] + " ";
-                                        if ((w2 + 1) < Words.Length) findedpwd += Words[w2 + 1] + " ";
-                                        if ((w2 + 2) < Words.Length) findedpwd += Words[w2 + 2] + " ";
-                                        listView1.Items.Add(new ListViewItem(new string[] { Files[f], findedpwd.TrimEnd(' ').TrimStart(' '), ext }));
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                toolStripStatusLabel1.Text = "Выполнено";
             }
-            toolStripStatusLabel1.Text = "Выполнено";
+            catch (OperationCanceledException)
+            {
+                toolStripStatusLabel1.Text = "Поиск остановлен пользователем";
+            }
+            catch (Exception ex)
+            {
+                toolStripStatusLabel1.Text = "Ошибка: " + ex.Message;
+            }
+            finally
+            {
+                _cts.Dispose();
+                _cts = null;
+                button1.Text = originalButtonText;
+            }
         }
 
         private static IList<string> GetTablenames(DataTableCollection tables)
@@ -382,6 +521,11 @@ namespace PasswordFinder
 
         private void Form1_FormClosing(object sender, FormClosingEventArgs e)
         {
+            if (_cts != null)
+            {
+                _cts.Cancel();
+            }
+
             Settings.Default.Save();
             Settings.Default.Upgrade();
         }
