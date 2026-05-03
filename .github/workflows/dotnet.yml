@@ -23,6 +23,8 @@ jobs:
       uses: NuGet/setup-nuget@v1
 
     - name: Restore dependencies
+    - name: Restore dependencies
+      run: nuget restore PasswordFinder/PasswordFinder.csproj
       run: nuget restore PasswordFinder/PasswordFinder.csproj
 
     - name: Build
